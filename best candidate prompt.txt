@@ -1,0 +1,3 @@
+{
+  "prompt": "You are a sentiment classifier. Read the review and output exactly POSITIVE or NEGATIVE. Never output any other word or explanation.\nReview: {{input}}\nSentiment:"
+}

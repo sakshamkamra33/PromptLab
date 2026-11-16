@@ -1,0 +1,790 @@
+
+import time
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+app = FastAPI(
+    title="PromptLab API",
+    description="Local prompt testing and experimentation",
+    version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_MODEL = "llama3.2:1b"
+
+
+class PromptRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=10000)
+
+
+@app.get("/")
+def home():
+    return {
+        "app": "PromptLab",
+        "status": "running",
+        "version": "0.1.0",
+    }
+
+
+@app.get("/api/health")
+async def health():
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                f"{OLLAMA_URL}/api/tags"
+            )
+            response.raise_for_status()
+            models = response.json().get("models", [])
+
+        available = any(
+            model.get("name", "").startswith(OLLAMA_MODEL)
+            for model in models
+        )
+
+        return {
+            "api": "ok",
+            "ollama": "connected",
+            "model": OLLAMA_MODEL,
+            "model_available": available,
+        }
+
+    except (httpx.HTTPError, ValueError):
+        return {
+            "api": "ok",
+            "ollama": "disconnected",
+            "model": OLLAMA_MODEL,
+            "model_available": False,
+        }
+
+
+@app.post("/api/run")
+async def run_prompt(request: PromptRequest):
+    start = time.perf_counter()
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            response = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": request.prompt,
+                    "stream": False,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        return {
+            "prompt": request.prompt,
+            "response": data.get("response", ""),
+            "model": data.get("model", OLLAMA_MODEL),
+            "latency_ms": round(
+                (time.perf_counter() - start) * 1000, 2
+            ),
+            "prompt_tokens": data.get("prompt_eval_count"),
+            "response_tokens": data.get("eval_count"),
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Model timed out. Try a shorter prompt.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not reach Ollama. Ensure Ollama is "
+                "running and llama3.2:1b is installed."
+            ),
+        )
+    
+class CompareRequest(BaseModel):
+    test_input: str = Field(min_length=1, max_length=5000)
+    prompt_a: str = Field(min_length=1, max_length=10000)
+    prompt_b: str = Field(min_length=1, max_length=10000)
+
+
+async def execute_comparison_prompt(
+    client: httpx.AsyncClient,
+    prompt_template: str,
+    test_input: str,
+):
+    # Insert the shared test input wherever {{input}} appears.
+    final_prompt = prompt_template.replace("{{input}}", test_input)
+    start = time.perf_counter()
+
+    response = await client.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": final_prompt,
+            "stream": False,
+        },
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    return {
+        "prompt": final_prompt,
+        "response": data.get("response", ""),
+        "model": data.get("model", OLLAMA_MODEL),
+        "latency_ms": round(
+            (time.perf_counter() - start) * 1000, 2
+        ),
+        "prompt_tokens": data.get("prompt_eval_count"),
+        "response_tokens": data.get("eval_count"),
+    }
+
+
+@app.post("/api/compare")
+async def compare_prompts(request: CompareRequest):
+    try:
+        # Run sequentially to reduce memory pressure on your PC.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            result_a = await execute_comparison_prompt(
+                client, request.prompt_a, request.test_input
+            )
+            result_b = await execute_comparison_prompt(
+                client, request.prompt_b, request.test_input
+            )
+
+        return {
+            "model": OLLAMA_MODEL,
+            "result_a": result_a,
+            "result_b": result_b,
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="The model timed out. Try shorter prompts or input.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Ollama. Check that Ollama is running.",
+        )
+    
+import re
+import statistics
+
+
+EVALUATION_DATASET = [
+    {
+        "text": "The delivery was quick and the product quality was excellent!",
+        "label": "positive",
+    },
+    {
+        "text": "Terrible product. It broke after one day.",
+        "label": "negative",
+    },
+    {
+        "text": "Exactly what I needed. Highly recommended.",
+        "label": "positive",
+    },
+    {
+        "text": "Poor quality and disappointing customer service.",
+        "label": "negative",
+    },
+    {
+        "text": "It works as described.",
+        "label": "positive",
+    },
+    {
+        "text": "The item arrived damaged and nobody helped me.",
+        "label": "negative",
+    },
+    {
+        "text": "Fantastic value for money. I would buy it again.",
+        "label": "positive",
+    },
+    {
+        "text": "The quality is awful and the price is far too high.",
+        "label": "negative",
+    },
+    {
+        "text": "I am happy with this purchase.",
+        "label": "positive",
+    },
+    {
+        "text": "I regret buying this. It was a waste of money.",
+        "label": "negative",
+    },
+]
+TEST_DATASET = [
+    {
+        "text": "The setup was simple, and everything worked perfectly.",
+        "label": "positive",
+    },
+    {
+        "text": "The package was late, and the item was damaged.",
+        "label": "negative",
+    },
+    {
+        "text": "Good performance and excellent battery life.",
+        "label": "positive",
+    },
+    {
+        "text": "The instructions were confusing and the device failed.",
+        "label": "negative",
+    },
+    {
+        "text": "I am satisfied with the quality and overall experience.",
+        "label": "positive",
+    },
+    {
+        "text": "It stopped working, and customer support was unhelpful.",
+        "label": "negative",
+    },
+    {
+        "text": "A useful product that exceeded my expectations.",
+        "label": "positive",
+    },
+    {
+        "text": "Cheap materials and disappointing performance.",
+        "label": "negative",
+    },
+    {
+        "text": "The product is reliable and easy to use.",
+        "label": "positive",
+    },
+    {
+        "text": "I would not recommend this product to anyone.",
+        "label": "negative",
+    },
+]
+class TestRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=10000)
+class EvaluateRequest(BaseModel):
+    prompt_a: str = Field(min_length=1, max_length=10000)
+    prompt_b: str = Field(min_length=1, max_length=10000)
+
+
+def normalize_sentiment(response_text: str):
+    text = response_text.strip().lower()
+    text = re.sub(r"[^a-z\s]", " ", text)
+    words = text.split()
+
+    has_positive = "positive" in words
+    has_negative = "negative" in words
+
+    # Ambiguous or unexpected outputs are invalid.
+    if has_positive == has_negative:
+        return None
+
+    return "positive" if has_positive else "negative"
+
+
+async def evaluate_one_prompt(
+    client,
+    prompt_template,
+    dataset=None,
+):
+    if dataset is None:
+        dataset = EVALUATION_DATASET
+    rows = []
+
+    for example in dataset:
+        result = await execute_comparison_prompt(
+            client,
+            prompt_template,
+            example["text"],
+        )
+
+        predicted = normalize_sentiment(result["response"])
+        correct = predicted == example["label"]
+
+        rows.append({
+            "text": example["text"],
+            "expected": example["label"],
+            "predicted": predicted,
+            "correct": correct,
+            "response": result["response"],
+            "latency_ms": result["latency_ms"],
+            "prompt_tokens": result["prompt_tokens"],
+            "response_tokens": result["response_tokens"],
+        })
+
+    total = len(rows)
+    valid = sum(row["predicted"] is not None for row in rows)
+    correct_count = sum(row["correct"] for row in rows)
+
+    latencies = [row["latency_ms"] for row in rows]
+    input_tokens = [
+        row["prompt_tokens"] for row in rows
+        if row["prompt_tokens"] is not None
+    ]
+    output_tokens = [
+        row["response_tokens"] for row in rows
+        if row["response_tokens"] is not None
+    ]
+
+    return {
+        "total_examples": total,
+        "correct": correct_count,
+        "accuracy_percent": round(correct_count / total * 100, 2),
+        "invalid_outputs": total - valid,
+        "invalid_output_rate_percent": round(
+            (total - valid) / total * 100, 2
+        ),
+        "average_latency_ms": round(statistics.mean(latencies), 2),
+        "average_input_tokens": (
+            round(statistics.mean(input_tokens), 2)
+            if input_tokens else None
+        ),
+        "average_output_tokens": (
+            round(statistics.mean(output_tokens), 2)
+            if output_tokens else None
+        ),
+        "details": rows,
+    }
+
+
+@app.get("/api/dataset")
+def get_evaluation_dataset():
+    return {
+        "name": "PromptLab Sentiment Dataset",
+        "total_examples": len(EVALUATION_DATASET),
+        "examples": EVALUATION_DATASET,
+    }
+@app.post("/api/test")
+async def test_prompt(request: TestRequest):
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0)
+        ) as client:
+            result = await evaluate_one_prompt(
+                client,
+                request.prompt,
+                dataset=TEST_DATASET,
+            )
+
+        return {
+            "model": OLLAMA_MODEL,
+            "dataset_name": "Held-out Sentiment Test Dataset",
+            "dataset_size": len(TEST_DATASET),
+            "result": result,
+            "warning": (
+                "Use this dataset for final validation, not prompt "
+                "generation or optimization."
+            ),
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Testing timed out. Try again or use a smaller model.",
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not communicate with Ollama: {exc}",
+        )
+
+@app.post("/api/evaluate")
+async def evaluate_prompts(request: EvaluateRequest):
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0)
+        ) as client:
+            # Sequential evaluation reduces local memory pressure.
+            result_a = await evaluate_one_prompt(
+                client, request.prompt_a
+            )
+            result_b = await evaluate_one_prompt(
+                client, request.prompt_b
+            )
+
+        return {
+            "model": OLLAMA_MODEL,
+            "dataset_size": len(EVALUATION_DATASET),
+            "result_a": result_a,
+            "result_b": result_b,
+        }
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail="Evaluation timed out. Try again or use shorter prompts.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Ollama. Check that Ollama is running.",
+        )
+    
+# ---------- AUTOMATIC PROMPT OPTIMIZATION ----------
+
+import json
+
+
+class OptimizeRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=10000)
+    objective: str = "balanced"
+    min_accuracy: int = 70
+
+
+async def generate_prompt_candidates(
+    client: httpx.AsyncClient,
+    baseline_prompt: str,
+):
+    """Generate candidates locally, with reliable fallback templates."""
+
+    fallback_candidates = [
+        (
+            "Classify the sentiment of this product review. "
+            "Return exactly one word: Positive or Negative. "
+            "Positive means favorable sentiment; Negative means "
+            "unfavorable sentiment.\n\nReview: {{input}}"
+        ),
+        (
+            "Determine whether the following product review expresses "
+            "positive or negative sentiment. Consider the overall meaning "
+            "of the review. Output only Positive or Negative, with no "
+            "explanation.\n\nReview: {{input}}"
+        ),
+        (
+            "Task: sentiment classification.\n"
+            "Read the product review and select one label.\n"
+            "Positive = favorable opinion or satisfaction.\n"
+            "Negative = unfavorable opinion or dissatisfaction.\n"
+            "Output exactly one label: Positive or Negative.\n\n"
+            "Review: {{input}}"
+        ),
+    ]
+
+    generation_prompt = f"""
+You are optimizing a prompt for product-review sentiment classification.
+
+The input is a product review.
+The output must be exactly one word: Positive or Negative.
+Positive means favorable sentiment.
+Negative means unfavorable sentiment.
+
+Generate three different prompt templates for this exact task.
+Every template must:
+- Explicitly describe sentiment classification.
+- Require exactly one output label: Positive or Negative.
+- Include the literal placeholder {{{{input}}}}.
+- Avoid unrelated topics, questions, and conversational replies.
+
+Return valid JSON only, using this structure:
+{{"candidates": ["template 1", "template 2", "template 3"]}}
+
+Baseline:
+{baseline_prompt}
+"""
+
+    generated = []
+
+    try:
+        response = await client.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": generation_prompt,
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0.3,
+                    "num_predict": 400,
+                },
+            },
+        )
+        response.raise_for_status()
+
+        raw_response = response.json().get("response", "")
+        parsed = json.loads(raw_response)
+        candidates = parsed.get("candidates", [])
+
+        if isinstance(candidates, list):
+            generated = candidates
+
+    except (
+        httpx.HTTPError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ):
+        # Use the predefined templates if generation or JSON parsing fails.
+        generated = []
+
+    cleaned = []
+    seen = {baseline_prompt.strip()}
+
+    # Try model-generated candidates first, then use fallbacks as needed.
+    for candidate in generated + fallback_candidates:
+        if not isinstance(candidate, str):
+            continue
+
+        candidate = candidate.strip()
+        normalized = candidate.lower()
+
+        valid = (
+            candidate
+            and "{{input}}" in candidate
+            and candidate not in seen
+            and "sentiment" in normalized
+            and "positive" in normalized
+            and "negative" in normalized
+        )
+
+        if valid:
+            cleaned.append(candidate)
+            seen.add(candidate)
+
+        if len(cleaned) == 3:
+            break
+
+    if len(cleaned) < 3:
+        raise ValueError(
+            "Could not assemble three valid candidate prompts."
+        )
+
+    return cleaned
+
+def rank_optimization_results(results, objective, min_accuracy=70):
+    """Rank prompt results according to the selected objective."""
+
+    for item in results:
+        accuracy = float(item["accuracy_percent"])
+        latency = float(item["average_latency_ms"])
+        invalid = int(item["invalid_outputs"])
+
+        item["eligible"] = accuracy >= min_accuracy
+
+        # Lower latency is better; normalize it to a 0–1 score.
+        item["speed_score"] = 1.0 / (1.0 + latency / 1000.0)
+
+        # Higher accuracy and fewer invalid outputs are better.
+        item["balanced_score"] = (
+            0.70 * (accuracy / 100.0)
+            + 0.20 * item["speed_score"]
+            + 0.10 * (1.0 - invalid / max(item["total_examples"], 1))
+        )
+
+    if objective == "accuracy":
+        results.sort(
+            key=lambda item: (
+                -item["accuracy_percent"],
+                item["invalid_outputs"],
+                item["average_latency_ms"],
+            )
+        )
+
+    elif objective == "speed":
+        eligible = [item for item in results if item["eligible"]]
+        ineligible = [item for item in results if not item["eligible"]]
+
+        eligible.sort(
+            key=lambda item: (
+                item["average_latency_ms"],
+                -item["accuracy_percent"],
+                item["invalid_outputs"],
+            )
+        )
+        ineligible.sort(
+            key=lambda item: (
+                -item["accuracy_percent"],
+                item["average_latency_ms"],
+            )
+        )
+        results[:] = eligible + ineligible
+
+    elif objective == "balanced":
+        results.sort(
+            key=lambda item: (
+                -item["balanced_score"],
+                -item["accuracy_percent"],
+                item["average_latency_ms"],
+            )
+        )
+
+    else:
+        raise ValueError(
+            "Objective must be accuracy, speed, or balanced."
+        )
+
+    for rank, item in enumerate(results, start=1):
+        item["rank"] = rank
+
+    return results
+objective: str = "balanced"
+min_accuracy: int = 70
+
+
+@app.post("/api/optimize")
+async def optimize_prompt(request: OptimizeRequest):
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0)
+        ) as client:
+
+            # Evaluate the baseline first.
+            baseline_result = await evaluate_one_prompt(
+                client, request.prompt
+            )
+
+            # Generate and evaluate candidates sequentially.
+            candidates = await generate_prompt_candidates(
+                client, request.prompt
+            )
+
+            results = [
+                {
+                    "name": "Baseline",
+                    "prompt": request.prompt,
+                    "is_baseline": True,
+                    **baseline_result,
+                }
+            ]
+
+            for index, candidate in enumerate(candidates, start=1):
+                metrics = await evaluate_one_prompt(
+                    client, candidate
+                )
+
+                results.append(
+                    {
+                        "name": f"Candidate {index}",
+                        "prompt": candidate,
+                        "is_baseline": False,
+                        **metrics,
+                    }
+                )
+
+            # Calculate scores and accuracy eligibility.
+            for result in results:
+                accuracy = float(result["accuracy_percent"])
+                latency = float(result["average_latency_ms"])
+                invalid = int(result["invalid_outputs"])
+                total = max(
+                    int(
+                        result.get(
+                            "total_examples",
+                            len(EVALUATION_DATASET),
+                        )
+                    ),
+                    1,
+                )
+
+                result["eligible"] = (
+                    accuracy >= request.min_accuracy
+                )
+                result["speed_score"] = (
+                    1.0 / (1.0 + latency / 1000.0)
+                )
+                result["balanced_score"] = (
+                    0.70 * (accuracy / 100.0)
+                    + 0.20 * result["speed_score"]
+                    + 0.10 * (1.0 - invalid / total)
+                )
+
+            # Rank according to the selected objective.
+            if request.objective == "accuracy":
+                results.sort(
+                    key=lambda result: (
+                        -result["accuracy_percent"],
+                        result["invalid_outputs"],
+                        result["average_latency_ms"],
+                    )
+                )
+
+            elif request.objective == "speed":
+                results.sort(
+                    key=lambda result: (
+                        not result["eligible"],
+                        (
+                            result["average_latency_ms"]
+                            if result["eligible"]
+                            else -result["accuracy_percent"]
+                        ),
+                        -result["accuracy_percent"],
+                        result["invalid_outputs"],
+                    )
+                )
+
+            elif request.objective == "balanced":
+                results.sort(
+                    key=lambda result: (
+                        -result["balanced_score"],
+                        -result["accuracy_percent"],
+                        result["average_latency_ms"],
+                    )
+                )
+
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Objective must be accuracy, speed, "
+                        "or balanced."
+                    ),
+                )
+
+            ranked_results = [
+                {"rank": rank, **result}
+                for rank, result in enumerate(results, start=1)
+            ]
+
+            return {
+                "model": OLLAMA_MODEL,
+                "dataset_size": len(EVALUATION_DATASET),
+                "candidates_generated": len(candidates),
+                "ranking_method": {
+                "accuracy": (
+                    "Accuracy descending, invalid outputs ascending, "
+                    "average latency ascending"
+                ),
+                "speed": (
+                    "Eligible prompts first, then average latency ascending; "
+                    "ineligible prompts follow"
+                ),
+                "balanced": (
+                    "Balanced score descending, then accuracy descending, "
+                    "then average latency ascending"
+                ),
+            }[request.objective],
+                "baseline": baseline_result,
+                "best_candidate": ranked_results[0],
+                "results": ranked_results,
+                "warning": (
+                    "Ranking uses the development dataset only. "
+                    "Validate the selected prompt on unseen examples."
+                ),
+            }
+
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Optimization timed out. The model may need more time. "
+                "Try again or use shorter prompts."
+            ),
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Ollama. Check that Ollama is running.",
+        )
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not generate valid prompt candidates: {exc}",
+        )
